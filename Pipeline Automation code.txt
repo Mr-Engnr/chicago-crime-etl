@@ -1,0 +1,109 @@
+import argparse
+import sqlite3
+import pandas as pd
+import numpy as np
+import os
+
+# -------------------- Functions --------------------
+
+def read_csv(csv_path):
+    print(f"Reading CSV from {csv_path}...")
+    df = pd.read_csv(csv_path)
+    return df
+
+def clean_and_engineer_features(df):
+    print("Cleaning data and engineering features...")
+    
+    # Drop missing coordinates
+    df = df.dropna(subset=['Latitude', 'Longitude'])
+    df = df[(df['Latitude'].between(-90, 90)) & (df['Longitude'].between(-180, 180))]
+
+    # Parse Date
+    df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
+    df['Year'] = df['Date'].dt.year
+    df['Month'] = df['Date'].dt.month
+    df['Day'] = df['Date'].dt.day
+    df['Hour'] = df['Date'].dt.hour
+    df['Weekday'] = df['Date'].dt.day_name()
+
+    # Drop exact duplicates
+    df = df.drop_duplicates()
+
+    # Standardize 'Primary Type' and 'Location Description'
+    df['Primary Type'] = df['Primary Type'].str.strip().str.title()
+    df['Location Description'] = df['Location Description'].fillna('Unknown').str.strip().str.title()
+
+    # Community area incident counts
+    spatial_density = df.groupby('Community Area').size().reset_index(name='Incidents_Per_Community')
+    df = df.merge(spatial_density, on='Community Area', how='left')
+
+    # Rolling 7-day average of incidents
+    df = df.set_index('Date')
+    daily_incidents = df.resample('D').size()
+    rolling_7day_avg = daily_incidents.rolling(window=7, min_periods=1).mean()
+    df = df.reset_index()
+    df['Date_only'] = df['Date'].dt.date
+    df['Rolling_7day_Avg'] = df['Date_only'].map(rolling_7day_avg)
+
+    # Weekend/Weekday flags
+    df['Is_Weekend'] = df['Weekday'].isin(['Saturday', 'Sunday'])
+    df['Is_Weekday'] = ~df['Is_Weekend']
+
+    return df
+
+def normalize_and_prepare_tables(df):
+    print("Normalizing tables...")
+    
+    crime_types = df[['Primary Type']].drop_duplicates().reset_index(drop=True)
+    crime_types['Primary_Type_ID'] = crime_types.index + 1
+    crime_types = crime_types[['Primary_Type_ID', 'Primary Type']]
+
+    locations = df[['Location Description']].drop_duplicates().reset_index(drop=True)
+    locations['Location_ID'] = locations.index + 1
+    locations = locations[['Location_ID', 'Location Description']]
+
+    df = df.merge(crime_types, on='Primary Type', how='left')
+    df = df.merge(locations, on='Location Description', how='left')
+
+    df['Incident_ID'] = df.index + 1
+
+    incidents = df[['Incident_ID', 'Date', 'Primary_Type_ID', 'Location_ID']]
+
+    return crime_types, locations, incidents
+
+def load_into_database(db_path, crime_types, locations, incidents):
+    print(f"Loading data into database at {db_path}...")
+    conn = sqlite3.connect(db_path)
+
+    crime_types.to_sql('Crime_Types', conn, index=False, if_exists='replace')
+    locations.to_sql('Locations', conn, index=False, if_exists='replace')
+    incidents.to_sql('Incidents', conn, index=False, if_exists='replace')
+
+    conn.commit()
+    conn.close()
+    print("Data loaded successfully!")
+
+# -------------------- Main Pipeline --------------------
+
+def main(args):
+    df = read_csv(args.csv_path)
+    df = clean_and_engineer_features(df)
+    crime_types, locations, incidents = normalize_and_prepare_tables(df)
+    load_into_database(args.db_path, crime_types, locations, incidents)
+    print("ETL pipeline completed successfully!")
+
+# -------------------- Entry Point --------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Automated ETL Pipeline for Crime Data")
+    parser.add_argument('--csv_path', type=str, required=True, help='Path to the input CSV file')
+    parser.add_argument('--db_path', type=str, required=True, help='Path to the SQLite database file')
+
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.csv_path):
+        raise FileNotFoundError(f"CSV file not found: {args.csv_path}")
+    if not os.path.isfile(args.db_path):
+        print(f"Database file not found. A new one will be created at: {args.db_path}")
+
+    main(args)
